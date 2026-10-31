@@ -1,10 +1,8 @@
 name: Auto update CF-Navs (upstream -> worker nav)
 
-# 每天检查上游最新 release；有新版本就构建并部署到既有 Worker `nav`
-# （自定义域名 nav.mars1024.com 绑在这个 Worker 上，名字必须保持 nav，否则域名会指向旧 Worker）
 on:
   schedule:
-    - cron: '23 4 * * *'      # 每天 04:23 UTC（北京 12:23）
+    - cron: '23 4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -17,70 +15,72 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
+    env:
+      SITE: https://nav.mars1024.com
     steps:
       - name: Resolve latest upstream release
         id: rel
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           TAG=$(curl -sS -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/lbjxr/CF-Navs/releases/latest | python3 -c "import sys,json;print(json.load(sys.stdin).get('tag_name',''))")
-          if [ -z "$TAG" ]; then echo "::error::未能解析上游最新 release"; exit 1; fi
+            https://api.github.com/repos/lbjxr/CF-Navs/releases/latest \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('tag_name',''))")
+          [ -n "$TAG" ] || { echo "::error::无法解析上游最新 release"; exit 1; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "上游最新版本: $TAG"
+          echo "上游最新: $TAG"
 
       - name: Read currently deployed version
         id: cur
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          CUR=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github.raw" \
+          CUR=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" \
             "https://api.github.com/repos/${{ github.repository }}/contents/.deployed-version?ref=${{ github.ref_name }}" 2>/dev/null | tr -d '\r\n' || true)
           echo "cur=$CUR" >> "$GITHUB_OUTPUT"
-          echo "当前已部署: ${CUR:-<未知>}"
+          echo "当前部署: ${CUR:-<未知>}"
 
-      - name: Skip if already latest
-        if: steps.cur.outputs.cur == steps.rel.outputs.tag
+      - name: Decide
+        id: decide
         run: |
-          echo "已是最新（${{ steps.rel.outputs.tag }}），跳过部署。"
+          if [ "${{ steps.cur.outputs.cur }}" = "${{ steps.rel.outputs.tag }}" ]; then
+            echo "need=0" >> "$GITHUB_OUTPUT"; echo "已是最新，跳过。"
+          else
+            echo "need=1" >> "$GITHUB_OUTPUT"; echo "需要升级。"
+          fi
 
-      - name: Checkout upstream at release tag
-        if: steps.cur.outputs.cur != steps.rel.outputs.tag
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        if: steps.decide.outputs.need == '1'
         with:
           repository: lbjxr/CF-Navs
           ref: ${{ steps.rel.outputs.tag }}
           path: src
 
       - name: Pin worker name to nav
-        if: steps.cur.outputs.cur != steps.rel.outputs.tag
+        if: steps.decide.outputs.need == '1'
         run: |
           cd src
           sed -i 's/^name = "cf-navs"/name = "nav"/' wrangler.toml
           grep -E '^name' wrangler.toml
 
-      - name: Setup Node
-        if: steps.cur.outputs.cur != steps.rel.outputs.tag
-        uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6
+        if: steps.decide.outputs.need == '1'
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: src/package-lock.json
 
-      - name: Install dependencies
-        if: steps.cur.outputs.cur != steps.rel.outputs.tag
+      - name: Install
+        if: steps.decide.outputs.need == '1'
         working-directory: src
         run: npm ci
 
       - name: Build
-        if: steps.cur.outputs.cur != steps.rel.outputs.tag
+        if: steps.decide.outputs.need == '1'
         working-directory: src
         run: npm run build
 
-      - name: Generate wrangler config (resolve D1 / KV ids)
-        if: steps.cur.outputs.cur != steps.rel.outputs.tag
+      - name: Generate wrangler config
+        if: steps.decide.outputs.need == '1'
         working-directory: src
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -89,7 +89,7 @@ jobs:
         run: npm run setup:wrangler
 
       - name: Deploy
-        if: steps.cur.outputs.cur != steps.rel.outputs.tag
+        if: steps.decide.outputs.need == '1'
         working-directory: src
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -97,23 +97,74 @@ jobs:
           WRANGLER_SEND_METRICS: "false"
         run: npm run wrangler -- deploy
 
-      - name: Record deployed version
-        if: steps.cur.outputs.cur != steps.rel.outputs.tag
+      - name: Health check
+        id: health
+        if: steps.decide.outputs.need == '1'
+        run: |
+          ok=0
+          for i in $(seq 1 12); do
+            CODE=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' "$SITE/" || echo 000)
+            echo "  第 $i 次: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then ok=1; break; fi
+            sleep 10
+          done
+          VER=$(curl -sS -m 15 "$SITE/api/data/version" || echo '')
+          echo "  /api/data/version: $VER"
+          if [ "$ok" = "1" ] && echo "$VER" | grep -q '"code":0'; then
+            echo "res=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "res=fail" >> "$GITHUB_OUTPUT"
+            echo "::error::部署后健康检查未通过"
+          fi
+
+      - name: Rollback on failure
+        if: steps.decide.outputs.need == '1' && steps.health.outputs.res == 'fail'
+        working-directory: src
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          echo "健康检查失败，回滚到上一版本……"
+          npm run wrangler -- rollback --yes || echo "::warning::自动回滚未成功，请人工检查"
+
+      - name: Mark deployed version
+        if: steps.decide.outputs.need == '1' && steps.health.outputs.res == 'ok'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd src
           SHA=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/contents/.deployed-version?ref=${{ github.ref_name }}" \
-            | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('sha',''))" 2>/dev/null || true)
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || true)
           BODY=$(printf '%s' "${{ steps.rel.outputs.tag }}" | base64 -w0)
-          if [ -n "$SHA" ]; then
-            curl -sS -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/contents/.deployed-version" \
-              -d "{\"message\":\"deployed ${{ steps.rel.outputs.tag }}\",\"content\":\"$BODY\",\"sha\":\"$SHA\",\"branch\":\"${{ github.ref_name }}\"}" >/dev/null
-          else
-            curl -sS -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/contents/.deployed-version" \
-              -d "{\"message\":\"deployed ${{ steps.rel.outputs.tag }}\",\"content\":\"$BODY\",\"branch\":\"${{ github.ref_name }}\"}" >/dev/null
+          PAYLOAD="{\"message\":\"deployed ${{ steps.rel.outputs.tag }}\",\"content\":\"$BODY\",\"branch\":\"${{ github.ref_name }}\""
+          [ -n "$SHA" ] && PAYLOAD="$PAYLOAD,\"sha\":\"$SHA\""
+          PAYLOAD="$PAYLOAD}"
+          curl -sS -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/.deployed-version" -d "$PAYLOAD" >/dev/null
+          echo "已记录 ${{ steps.rel.outputs.tag }}"
+
+      - name: Heartbeat (keep the schedule alive)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          CUR=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/.heartbeat?ref=${{ github.ref_name }}" 2>/dev/null | tr -d '\r\n' || true)
+          TODAY=$(date -u +%F)
+          if [ -n "$CUR" ]; then
+            LAST=$(date -u -d "$CUR" +%s 2>/dev/null || echo 0)
+            NOW=$(date -u +%s)
+            AGE=$(( (NOW - LAST) / 86400 ))
+            if [ "$AGE" -lt 30 ]; then echo "心跳仍新鲜（${AGE} 天），跳过。"; exit 0; fi
           fi
-          echo "已记录部署版本 ${{ steps.rel.outputs.tag }}"
+          SHA=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/.heartbeat?ref=${{ github.ref_name }}" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || true)
+          BODY=$(printf '%s' "$TODAY" | base64 -w0)
+          PAYLOAD="{\"message\":\"heartbeat $TODAY\",\"content\":\"$BODY\",\"branch\":\"${{ github.ref_name }}\""
+          [ -n "$SHA" ] && PAYLOAD="$PAYLOAD,\"sha\":\"$SHA\""
+          PAYLOAD="$PAYLOAD}"
+          curl -sS -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/.heartbeat" -d "$PAYLOAD" >/dev/null
+          echo "心跳已更新为 $TODAY"
